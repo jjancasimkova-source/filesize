@@ -1,3 +1,36 @@
+<#
+.SYNOPSIS
+Find the largest files on one or more drives or folders.
+
+.DESCRIPTION
+Scans the provided paths (or every filesystem drive if none are supplied), keeps track of
+the top N largest files, and optionally writes the results to CSV or formats sizes for
+easier reading.
+
+.PARAMETER Paths
+One or more folders or drive roots to scan. Defaults to every filesystem drive.
+
+.PARAMETER Top
+How many results to keep. Must be a positive integer. Default is 10.
+
+.PARAMETER IncludeHidden
+Include hidden and system files in the scan.
+
+.PARAMETER MinSizeBytes
+Ignore files smaller than this value. Accepts numeric values or PowerShell size literals.
+
+.PARAMETER OutputCsv
+Write the results to the specified CSV file.
+
+.PARAMETER HumanReadable
+Add gigabyte and megabyte columns to the output table.
+
+.PARAMETER ExcludePaths
+Skip any files that reside under the supplied directory roots.
+
+.PARAMETER ExcludeExtensions
+Skip files whose extensions match the supplied list (ex: `.log`).
+#>
 [CmdletBinding()]
 param(
     [string[]]$Paths,
@@ -5,7 +38,9 @@ param(
     [switch]$IncludeHidden,
     [long]$MinSizeBytes = 0,
     [string]$OutputCsv,
-[switch]$HumanReadable
+    [switch]$HumanReadable,
+    [string[]]$ExcludePaths,
+    [string[]]$ExcludeExtensions
 )
 
 # Maintain a rolling top-N list so we don't hold every file in memory on large drives.
@@ -30,6 +65,35 @@ if ($MinSizeBytes -lt 0) {
     throw "MinSizeBytes cannot be negative."
 }
 
+$normalizedExcludePaths = if ($ExcludePaths) {
+    $ExcludePaths | ForEach-Object {
+        try {
+            $fullExcludePath = [System.IO.Path]::GetFullPath($_)
+
+            if (-not $fullExcludePath.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+                $fullExcludePath += [System.IO.Path]::DirectorySeparatorChar
+            }
+
+            $fullExcludePath
+        }
+        catch {
+            Write-Warning "Exclude path '$_' is invalid and will be ignored."
+            $null
+        }
+    } | Where-Object { $_ }
+} else { @() }
+
+$normalizedExcludeExtensions = if ($ExcludeExtensions) {
+    $ExcludeExtensions | ForEach-Object {
+        if ($_ -notmatch '^\.') {
+            ".$_"
+        }
+        else {
+            $_
+        }
+    } | ForEach-Object { $_.ToLowerInvariant() }
+} else { @() }
+
 if (-not $Paths) {
     $Paths = Get-PSDrive -PSProvider FileSystem | ForEach-Object { $_.Root } |
         Sort-Object -Unique
@@ -40,6 +104,24 @@ $TopFiles = [System.Collections.Generic.List[pscustomobject]]::new()
 foreach ($path in $Paths) {
     if (-not (Test-Path -LiteralPath $path)) {
         Write-Warning "Path '$path' not found. Skipping."
+        continue
+    }
+
+    $pathFull = [System.IO.Path]::GetFullPath($path)
+    if (-not $pathFull.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+        $pathFull += [System.IO.Path]::DirectorySeparatorChar
+    }
+
+    $skipPath = $false
+    foreach ($excludeRoot in $normalizedExcludePaths) {
+        if ($pathFull.StartsWith($excludeRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $skipPath = $true
+            break
+        }
+    }
+
+    if ($skipPath) {
+        Write-Verbose "Skipping excluded path $path"
         continue
     }
 
@@ -69,8 +151,25 @@ foreach ($path in $Paths) {
                 return
             }
 
+            $fullPath = $_.FullName
+
+            foreach ($excludePath in $normalizedExcludePaths) {
+                # Skip anything located under an excluded directory.
+                if ($fullPath.StartsWith($excludePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    return
+                }
+            }
+
+            if ($normalizedExcludeExtensions.Count -gt 0) {
+                # Skip files with extensions the caller does not care about.
+                $fileExtension = [System.IO.Path]::GetExtension($fullPath).ToLowerInvariant()
+                if ($normalizedExcludeExtensions -contains $fileExtension) {
+                    return
+                }
+            }
+
             Add-TopFile ([pscustomobject]@{
-                FullName = $_.FullName
+                FullName = $fullPath
                 Length   = $_.Length
             })
         }
